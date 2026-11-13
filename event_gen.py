@@ -219,7 +219,7 @@ class ClickstreamGenerator:
     one so the pool size (and therefore concurrency) stays constant.
     """
 
-    def __init__(self, um_users: int = 5000, concurrent_sessions: int = 300,
+    def __init__(self, num_users: int = 5000, concurrent_sessions: int = 300,
                  num_products: int = 200, max_steps_per_session: int = 12,
                  seed: int | None = None):
         self.rng = random.Random(seed)
