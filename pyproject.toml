@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stream_processing_project"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "confluent-kafka==2.5.0",
+    "prometheus-client==0.20.0",
+    "pyyaml>=6.0",
+    "apache-flink==1.19.1",
+]
+
+[project.scripts]
+producer = "producer:main"
+multi-producer = "multi_producer:main"
+event-injector = "event_injector:main"
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "producer.py",
+    "multi_producer.py",
+    "event_gen.py",
+    "event_injector.py",
+]
+
+[tool.uv.extra-build-dependencies]
+# apache-beam's setup.py imports pkg_resources at build time; newer setuptools
+# dropped it, so pin an older setuptools that still bundles it.
+apache-beam = ["setuptools<81"]
