@@ -1,0 +1,44 @@
+hostPort: kafka:9101
+lowercaseOutputName: true
+
+rules:
+  # Aggregate broker bytes in/out and message rate
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec|MessagesInPerSec)><>OneMinuteRate'
+    name: kafka_server_$1_rate
+    type: GAUGE
+
+  # Per-topic bytes in/out
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec|MessagesInPerSec), topic=(.+)><>OneMinuteRate'
+    name: kafka_server_topic_$1_rate
+    labels:
+      topic: "$2"
+    type: GAUGE
+
+  # Produce request latency
+  - pattern: 'kafka.network<type=RequestMetrics, name=TotalTimeMs, request=Produce><>(Mean|99thPercentile)'
+    name: kafka_network_produce_total_time_ms_$1
+    type: GAUGE
+
+  # Request handler idle percent — if this drops below 20%, broker is CPU-saturated
+  - pattern: 'kafka.server<type=KafkaRequestHandlerPool, name=RequestHandlerAvgIdlePercent><>OneMinuteRate'
+    name: kafka_server_request_handler_avg_idle_percent
+    type: GAUGE
+
+  # Broker JVM process CPU load (0.0–1.0) — key for CPU starvation and compression experiments
+  - pattern: 'java.lang<type=OperatingSystem><>ProcessCpuLoad'
+    name: kafka_jvm_process_cpu_load
+    type: GAUGE
+
+  # JVM GC — collection time in ms (cumulative) — key for memory pressure experiment
+  - pattern: 'java.lang<type=GarbageCollector, name=(.+)><>CollectionTime'
+    name: kafka_jvm_gc_collection_time_ms_total
+    labels:
+      gc: "$1"
+    type: COUNTER
+
+  # JVM GC — collection count (cumulative)
+  - pattern: 'java.lang<type=GarbageCollector, name=(.+)><>CollectionCount'
+    name: kafka_jvm_gc_collection_count_total
+    labels:
+      gc: "$1"
+    type: COUNTER

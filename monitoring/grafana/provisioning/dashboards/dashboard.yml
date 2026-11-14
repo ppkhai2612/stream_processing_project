@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: stream-processing-project
+    folder: Stream Processing Project
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
