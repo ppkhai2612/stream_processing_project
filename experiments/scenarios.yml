@@ -1,0 +1,240 @@
+global:
+  bootstrap: "localhost:9092"
+  internal_bootstrap: "kafka:29092"  # address Flink (inside the Docker network) uses instead
+  topic: "clickstream"
+  pushgateway: "localhost:9091"
+  default_broker:
+    cpus: "4"
+    memory: "2g"
+  default_topic:
+    partitions: 6
+    retention_hours: 1
+
+# ─────────────────────────────────────────────
+# Kafka + Flink + ClickHouse pipeline scenarios
+# ─────────────────────────────────────────────
+
+scenarios:
+
+  - id: 1
+    name: "Raw event passthrough: true single-event latency (no windowing)"
+    tier: 1
+    category: infra
+    summary: >
+      Behavior: every clickstream event is written straight to ClickHouse as its
+      own row, no windowing/aggregation at all -- isolates TRUE single-event
+      pipeline latency (Kafka + Flink + ClickHouse overhead) from scenario 2's
+      windowed_revenue latency, which bakes in the window's deliberate wait time
+      (window_seconds + watermark_seconds) on top of real overhead. Run this
+      scenario, then scenario 2, then latency_breakdown.py to decompose observed
+      latency into real pipeline overhead vs windowing wait.
+    description: >
+      Runs an uncapped producer (rate omitted -- defaults to -1) against the
+      raw_event_sink.py PyFlink job, which has no key_by/window/watermark logic
+      at all -- just parse and forward. One row per event is much higher
+      ClickHouse insert volume than windowed output, so this is also a
+      full-throughput stress test for the raw passthrough path, not just a
+      latency measurement. Writes to the raw_events table (event_id, event_time,
+      event_type, category, country, inserted_at), batched via
+      sink_batch_rows=5000 (within ClickHouse's own recommended bulk-insert
+      range of 1,000-100,000 rows per insert -- see
+      https://clickhouse.com/docs/en/optimize/bulk-inserts -- raised from an
+      earlier 200 default after observing growing insert latency under an
+      uncapped producer load).
+    broker:
+      cpus: "4"                              # Kafka broker's CPU
+      memory: "2g"                           # Kafka broker's RAM
+    topic:
+      partitions: 6                          # matches Flink parallelism for 1:1 partition-subtask alignment
+      retention_hours: 1                     # messages auto-deleted after 1h
+    producers:
+      processes: 1                           # one producer process
+      duration: 900                          # runs for 900s the stops
+      acks: "1"                              # leader-only ack before send is considered successful
+      linger_ms: 5                           # ms to wait, batching more messages, before sending
+      batch_size: 524288                     # max producer batch size in bytes (512 KiB)
+      compression: none                      # no message compression
+      key_field: session_id                  # event field used as Kafka message key (controls partition routing)
+    flink:
+      job: "raw_event_sink.py"               # PyFlink job script submitted
+      parallelism: 6                         # 6 parallel subtask per task
+      group_id: "flink-raw-events"           # Kafka consumer group id, isolate offset tracking per scenario
+      sink_batch_rows: 5000                  # rows buffered per sink instance before one Clickhouse insert
+    clickhouse:
+      database: "stream_processing_project"  # Clickhouse database
+      table: "raw_events"                    # Clickhouse table
+    manual_steps:
+      - "Watch Flink job status: http://localhost:8081 -> Running Jobs"
+      - "After this scenario and scenario 2 have both run recently: uv run python latency_breakdown.py"
+    watch:
+      - "Broker Bytes In/sec (JMX) — producer load at full uncapped throughput"
+      - "ClickHouse row count in raw_events — should track total events sent almost 1:1, with near-zero delay (no window wait)"
+    expected: >
+      raw_events latency (event_time -> inserted_at) should be dramatically lower
+      than scenario 2's windowed_revenue latency (window_end -> inserted_at) --
+      typically low single-digit seconds here vs ~35s there, since there's no
+      window to wait for. latency_breakdown.py quantifies the exact gap.
+    notes: >
+      This is deliberately the first scenario now, since it's the more
+      fundamental measurement (true pipeline latency) that scenario 2's windowed
+      latency should be compared against, not the other way around.
+   
+  - id: 2
+    name: "Producer -> Kafka -> Flink -> ClickHouse windowed revenue"
+    tier: 1
+    category: infra
+    summary: >
+      Behavior: ALL clickstream events (not just purchases -- a deliberate
+      full-throughput stress test) flow through Kafka into a PyFlink tumbling-window
+      job, and a row per (window, category, country) appears in ClickHouse
+      roughly every window_seconds + watermark_seconds, with order_count = count of
+      every event of any type (no revenue/amount field -- most event types don't
+      carry one, so this job is purely a throughput/count exercise now).
+      Key metrics: Broker Bytes In/sec (producer load), Flink true-ingest-rate vs
+      window+sink out-rate (should track each other closely since nothing is
+      filtered out anymore), ClickHouse row count (grows every window).
+    description: >
+      Runs an uncapped producer against Kafka, submits the windowed_revenue PyFlink
+      job (reads clickstream, processes every event with no type filter, counts
+      events per 30s tumbling window keyed by category+country), and writes results
+      to ClickHouse. Reset cancels any previously running Flink job and truncates
+      the ClickHouse table so each run starts from a clean slate.
+    broker:
+      cpus: "4"
+      memory: "2g"
+    topic:
+      partitions: 6
+      retention_hours: 1
+    producers:
+      processes: 1
+      delay_ms: 0.05
+      duration: 1800
+      acks: "1"
+      linger_ms: 5
+      batch_size: 524288
+      compression: none
+      key_field: session_id
+    flink:
+      job: "windowed_revenue.py"
+      window_seconds: 30
+      watermark_seconds: 5
+      parallelism: 6
+      group_id: "flink-windowed-revenue"
+    clickhouse:
+      database: "stream_processing_project"
+      table: "windowed_revenue"
+    manual_steps:
+      - "Watch Flink job status: http://localhost:8081 -> Running Jobs"
+      - "Query results as they land: docker exec clickhouse clickhouse-client --query \"SELECT * FROM stream_processing_project.windowed_revenue ORDER BY window_start DESC LIMIT 10\""
+      - "Re-run the query every ~30s and watch new rows appear -- this is the 'see it update' goal"
+    watch:
+      - "Broker Bytes In/sec (JMX) — should reach/exceed the 30 MB/s target with an uncapped producer"
+      - "Flink web UI (localhost:8081) — job should show RUNNING with steadily increasing numRecordsIn/Out"
+      - "ClickHouse row count — should grow by one row per (category, country) roughly every 30s"
+    expected: >
+      A new batch of windowed_revenue rows appears roughly every
+      window_seconds + watermark_seconds (~35s here). Row count and order_count
+      values grow monotonically while the producer runs; Flink's true ingest
+      rate (all event types) should track total producer throughput closely,
+      since no filter removes anything anymore -- this is the full-volume
+      stress test, not just the purchase subset.
+    notes: >
+      This is the first end-to-end scenario across all three tools. If no rows
+      appear after ~1 minute, check: (1) Flink job is RUNNING (localhost:8081),
+      (2) clickhouse-server logs (docker logs clickhouse) for sink connection
+      errors.
+  
+  - id: 3
+    name: "Correctness: basic window sum"
+    tier: 1
+    category: correctness
+    summary: >
+      Behavior: a small, hand-computable event sequence produces an exact expected
+      order_count in ClickHouse -- not a randomized load test, a pass/fail
+      correctness check. Validated 2026-07-29 (revenue=35, order_count=3, back when
+      the job still summed amount) -- the job no longer computes revenue (see
+      CONTEXT.md "process ALL events" decision), so the current assertion is
+      order_count=3 only; the event amounts in basic_window.json are now unused
+      by the job but harmless to leave as-is.
+    description: >
+      Uses event_injector.py (not producer.py) to send 3 events inside one 30s
+      window, plus a 4th event 40s later to push the watermark past the window so
+      it fires. This is deliberately NOT runnable via the normal producer/consumer
+      sections below -- it needs the deterministic injector, since a randomized
+      event stream can't have a hand-computed expected output.
+    broker:
+      cpus: "4"
+      memory: "2g"
+    topic:
+      partitions: 6
+      retention_hours: 1
+    flink:
+      job: "windowed_revenue.py"
+      window_seconds: 30
+      watermark_seconds: 5
+      idleness_seconds: 10
+      parallelism: 6
+      group_id: "flink-correctness-basic-window"
+    clickhouse:
+      database: "stream_processing_project"
+      table: "windowed_revenue"
+    manual_steps:
+      - "Ensure the Flink job above is submitted and RUNNING (this scenario's runner support is reset-only; see notes)"
+      - "uv run python event_injector.py --topic clickstream --align-window-seconds 30 --events experiments/events/basic_window.json"
+      - "Wait ~15s, then: docker exec clickhouse clickhouse-client --query \"SELECT * FROM stream_processing_project.windowed_revenue ORDER BY window_start\""
+    expected: >
+      Exactly one row with order_count=3. (A second row from the 4th/pusher
+      event's own window may also appear -- ignore it, only the first window's
+      count is asserted.)
+    notes: >
+      run_experiment.py currently only resets (cancels old job, truncates
+      ClickHouse, resubmits the Flink job) for this scenario -- it does not yet
+      run event_injector.py or assert the result automatically. Do steps 2-3
+      manually per manual_steps above.
+
+  - id: 4
+    name: "Correctness: late-event threshold (watermark tolerance)"
+    tier: 1
+    category: correctness
+    summary: >
+      Behavior: an event arriving out of send-order but before its window closes
+      is included; the same event arriving after the window has already fired is
+      dropped. Validated 2026-07-29 (revenue=1149, order_count=3, back when the
+      job still summed amount) -- the job no longer computes revenue (see
+      CONTEXT.md "process ALL events" decision), so the current assertion is
+      order_count=3 only: the tolerated late event is counted, the truly-late one
+      is not (order_count would be 4 if it were wrongly included).
+    description: >
+      Uses event_injector.py to send 6 events, all pinned to one Kafka partition
+      via an explicit session_id (so real send order is deterministic): two
+      on-time events, a "pusher" that advances the watermark to just short of
+      closing the window, a late-in-send-order-but-still-on-time event (must be
+      included), a second pusher that actually closes the window, then a truly-late
+      event sent after the window already fired (must be dropped, silently, since
+      no allowedLateness/side-output is configured).
+    broker:
+      cpus: "4"
+      memory: "2g"
+    topic:
+      partitions: 6
+      retention_hours: 1
+    flink:
+      job: "windowed_revenue.py"
+      window_seconds: 30
+      watermark_seconds: 5
+      idleness_seconds: 10
+      parallelism: 6
+      group_id: "flink-correctness-late-event"
+    clickhouse:
+      database: "stream_processing_project"
+      table: "windowed_revenue"
+    manual_steps:
+      - "Ensure the Flink job above is submitted and RUNNING (reset-only; see notes)"
+      - "uv run python event_injector.py --topic clickstream --key-field session_id --align-window-seconds 30 --events experiments/events/late_event.json"
+      - "Wait ~15s, then: docker exec clickhouse clickhouse-client --query \"SELECT * FROM stream_processing_project.windowed_revenue ORDER BY window_start\""
+    expected: >
+      Exactly one row: order_count=3. The 6th (truly-late) event must NOT be
+      counted -- order_count must not be 4 -- and no separate row for it either.
+    notes: >
+      Same reset-only limitation as scenario 3 -- run_experiment.py does not yet
+      invoke event_injector.py or assert results automatically.
