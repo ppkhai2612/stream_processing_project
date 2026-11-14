@@ -155,7 +155,7 @@ def main():
 
             key = None
             if args.key_field != "none":
-                key_val = event.get(args.key)
+                key_val = event.get(args.key_field)
                 key = key_val.encode() if key_val is not None else None
             
             try:
